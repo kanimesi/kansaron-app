@@ -28,6 +28,7 @@ const PDF_BOOKS = [
 ];
 const pdfForChapter = ch => (ch <= 3 ? 'input1' : 'input2');
 let pdfUrls = {};   // 取り込み済みPDFの Blob URL(この起動の間だけ有効)
+let figUrls = {};   // §3.1-3: Input差し込み画像(img/*.webp)の Blob URL。起動中だけ有効で、同じ src はキャッシュして再利用する。起動時に一括生成はしない
 
 async function loadAll() {
   D.manifest = await db.get('pack', 'manifest.json');
@@ -45,6 +46,25 @@ async function loadAll() {
   for (const k of Object.keys(pdfUrls)) URL.revokeObjectURL(pdfUrls[k]);
   pdfUrls = {};
   for (const [k, v] of Object.entries(PDFS)) if (v?.blob) pdfUrls[k] = URL.createObjectURL(v.blob);
+  // §3.1-3: パック再取り込み時(loadAll)は、教材PDF用URLと同様に差し込み画像URLも失効させる
+  for (const k of Object.keys(figUrls)) { try { URL.revokeObjectURL(figUrls[k]); } catch { /* 失効できないURLは無視 */ } }
+  figUrls = {};
+}
+// §3.1-3: 頁を開いたときに、その頁の fig 分だけ pack store から Blob を取得して URL を作る(起動時一括生成はしない)
+async function figUrl(src) {
+  if (!src) return null;
+  if (figUrls[src]) return figUrls[src];
+  let v = null;
+  try { v = await db.get('pack', src); } catch { return null; }
+  if (!v) return null;
+  let blob = null;
+  if (typeof Blob !== 'undefined' && v instanceof Blob) blob = v;
+  else if (v instanceof Uint8Array) blob = new Blob([v], { type: 'image/webp' });
+  else if (v instanceof ArrayBuffer) blob = new Blob([v], { type: 'image/webp' });
+  else if (v?.blob instanceof Blob) blob = v.blob; // 念のための包み形式(通常は Blob そのものが入っている)
+  else return null;
+  try { figUrls[src] = URL.createObjectURL(blob); } catch { return null; }
+  return figUrls[src];
 }
 // PDFを開く。ページ指定(#page=)は端末のPDFビューアが対応している場合だけ効く(効かない場合は先頭から開く)。
 function openPdf(bookKey, page) {
@@ -117,6 +137,109 @@ async function inputChapter(ch) {
   }
   return h;
 }
+// ---------- Input原文の表・図差し込み(仕様 §3.2/§3.3) ----------
+// 整形表示(rawView 偽)かつ tables/figs がある頁だけが対象。「そのまま表示」では一切出さない(§3.4)。
+// text/raw 自体は一切変えない(二重表示は U3 で受け入れ済み)。
+function collectInserts(pg) {
+  const out = [];
+  if (Array.isArray(pg.tables)) for (const t of pg.tables) {
+    if (!t || typeof t.html !== 'string' || !t.html) continue; // §3.3: html が空・欠落なら読み飛ばす
+    out.push({ kind: 'table', entry: t, order: Number.isFinite(+t.order) ? +t.order : out.length });
+  }
+  if (Array.isArray(pg.figs)) for (const f of pg.figs) {
+    if (!f) continue;
+    out.push({ kind: 'fig', entry: f, order: Number.isFinite(+f.order) ? +f.order : out.length });
+  }
+  out.sort((a, b) => a.order - b.order);
+  return out;
+}
+function insertCaption(ins, atTail) {
+  const e = ins.entry;
+  let cap;
+  if (ins.kind === 'table') {
+    const flags = Array.isArray(e.flags) ? e.flags : [];
+    // §3.2/U8: 注記は header-split のみ。punct-float のみ等では警告を出さない
+    cap = flags.includes('header-split') ? '表（原文から再構成）※見出し行は原本と見比べてください' : '表（原文から再構成）';
+  } else {
+    cap = e.kind === 'table' ? '表（原文の画像）' : '図（原文の画像）';
+    if (e.alt) cap += ' ' + e.alt;
+  }
+  if (atTail) cap += '（原本での位置が特定できなかったため、頁の末尾に表示しています）';
+  return cap;
+}
+async function renderInsert(ins, urls, atTail) {
+  const e = ins.entry, cap = insertCaption(ins, atTail);
+  if (ins.kind === 'table') {
+    // §3.2: 表 html は自生成データのためエスケープせず、横スクロール可能なラッパーにそのまま挿入する
+    return `<div class="insert"><div class="tbl-wrap">${e.html}</div><p class="insert-cap">${esc(cap)}</p></div>`;
+  }
+  const url = e.src ? urls[e.src] : null;
+  if (!url) {
+    // §3.3: Blob が無い場合は画面全体を落とさず、alt＋取り込み直しの案内枠を出す
+    return `<div class="insert"><div class="fig-missing"><p>${esc(e.alt || '図表')}</p><p>画像が取り込まれていません。教材データを改訂3以降で取り込み直してください</p></div><p class="insert-cap">${esc(cap)}</p></div>`;
+  }
+  return `<div class="insert"><img class="fig-img" data-act="fig-zoom" src="${esc(url)}" alt="${esc(e.alt || '')}"><p class="insert-cap">${esc(cap)}</p></div>`;
+}
+async function buildFormattedBody(pg) {
+  const text = String(pg.text ?? '');
+  const inserts = collectInserts(pg);
+  if (!inserts.length) return `<div class="src">${esc(text)}</div>`;
+  // この頁の fig 分だけ Blob URL を用意する(§3.1-3)
+  const urls = {};
+  for (const ins of inserts) if (ins.kind === 'fig' && ins.entry.src && !(ins.entry.src in urls)) urls[ins.entry.src] = await figUrl(ins.entry.src);
+  // §3.3: カーソル方式。order 順に、前回位置より後ろから前方検索する(afterOccurrence 対応)
+  const resolved = [], tail = [];
+  let cursor = 0;
+  for (const ins of inserts) {
+    const e = ins.entry, after = typeof e.after === 'string' ? e.after : null;
+    if (after === '' && e.position === 'top') { resolved.push({ ins, pos: 0 }); continue; }
+    if (!after) { tail.push(ins); continue; }
+    const want = Number.isInteger(e.afterOccurrence) && e.afterOccurrence >= 0 ? e.afterOccurrence : 0;
+    let pos = cursor, found = -1;
+    for (let k = 0; k <= want; k++) {
+      const idx = text.indexOf(after, pos);
+      if (idx < 0) { found = -1; break; }
+      found = idx;
+      pos = idx + Math.max(after.length, 1);
+    }
+    if (found < 0) { tail.push(ins); continue; }
+    const at = found + after.length;
+    resolved.push({ ins, pos: at });
+    if (at > cursor) cursor = at;
+  }
+  resolved.sort((a, b) => a.pos - b.pos || a.ins.order - b.ins.order);
+  const parts = [];
+  let prev = 0;
+  for (const r of resolved) {
+    const frag = text.slice(prev, r.pos);
+    if (frag.trim()) parts.push(`<div class="src">${esc(frag)}</div>`);
+    parts.push(await renderInsert(r.ins, urls, false));
+    prev = r.pos;
+  }
+  const rest = text.slice(prev);
+  if (rest.trim()) parts.push(`<div class="src">${esc(rest)}</div>`);
+  for (const ins of tail) parts.push(await renderInsert(ins, urls, true));
+  return parts.join('');
+}
+// §3.6: 拡大表示(オーバーレイ方式)。選んだ理由は報告参照。
+// 元の頁は再描画しないので、閉じれば元のスクロール位置のまま戻れる。画像タップで2倍幅に切替でき、
+// ビューポートは拡大を禁止していないためピンチズームでも詳細を確認できる。
+function openFigZoom(img) {
+  closeFigZoom();
+  const ov = document.createElement('div');
+  ov.className = 'fig-overlay'; ov.id = 'fig-overlay';
+  ov.setAttribute('role', 'dialog'); ov.setAttribute('aria-modal', 'true');
+  ov.innerHTML = `<button type="button" class="fig-close" aria-label="閉じる">× 閉じる</button><div class="fig-scroll"><img src="${esc(img.getAttribute('src') || '')}" alt="${esc(img.getAttribute('alt') || '')}"></div>`;
+  ov.addEventListener('click', ev => {
+    if (ev.target.closest('.fig-close')) { closeFigZoom(); return; }
+    const im = ev.target.closest('.fig-scroll img');
+    if (im) { im.classList.toggle('zoomed'); return; }
+    if (ev.target === ov || ev.target.classList.contains('fig-scroll')) closeFigZoom();
+  });
+  document.body.appendChild(ov);
+}
+function closeFigZoom() { document.getElementById('fig-overlay')?.remove(); }
+
 async function inputPage(printed) {
   // 教材ページ番号の先頭は丸数字（①〜⑩）なので、章番号は丸数字から求める（+printed.split だと NaN になる）
   const ch = '①②③④⑤⑥⑦⑧⑨⑩'.indexOf(printed[0]) + 1; const pages = await chapterPages(ch); const idx = pages.findIndex(p => p.printed === printed);
@@ -127,6 +250,9 @@ async function inputPage(printed) {
   const here = D.items.filter(i => i.inputPage === printed);
   const nt = NT['page:' + printed] || '';
   const book = pdfForChapter(ch), hasPdf = !!PDFS[book]?.blob;
+  // §3.2/§3.4: 整形表示のときだけ差し込みを組み立てる。そのまま表示(raw)では現行どおり1ブロックで差し込みなし
+  const hasInserts = !raw && ((Array.isArray(pg.tables) && pg.tables.length) || (Array.isArray(pg.figs) && pg.figs.length));
+  const bodyHtml = raw ? `<div class="src">${esc(pg.raw)}</div>` : hasInserts ? await buildFormattedBody(pg) : `<div class="src">${esc(pg.text)}</div>`;
   return `
   ${here.map(i => `<div class="card"><div>${badge(i.importance)} <b>${i.no} ${esc(i.title)}</b> <span class="muted">(重要度は教材の値)</span></div>
     ${i.importanceNotes?.length ? `<div class="warn">${i.importanceNotes.map(esc).join('<br>')}</div>` : ''}
@@ -138,7 +264,7 @@ async function inputPage(printed) {
     : `<p class="muted">まだ教材PDFが取り込まれていません。「メニュー」→「教材PDFの取り込み」で ${esc(PDF_BOOKS.find(b => b.key === book).label)} のPDFを取り込むと、この頁を原本のまま開けます。</p><a class="btn sub" href="#/menu">メニューへ</a>`}</div>
   <p><span class="label">教材原文</span><span class="muted">${printed}(PDF ${pg.pdf}頁)・${idx + 1}/${pages.length}</span>
   <button class="btn sub" data-act="rawtoggle" style="float:right;margin:0;padding:4px 10px;font-size:13px">${raw ? '整形表示へ' : 'そのまま表示'}</button></p>
-  <div class="src">${esc(raw ? pg.raw : pg.text)}</div>
+  ${bodyHtml}
   <p class="muted">※抽出テキストです。図表は崩れることがあります。正確さが必要なときは原本PDFで確認してください。</p>
   <div class="card"><h2><span class="label ai" style="background:var(--navy)">自分のメモ</span></h2><textarea data-act="note" data-key="page:${printed}" placeholder="この頁のメモ">${esc(nt)}</textarea></div>
   <div class="pager"><a class="btn sub" href="${idx > 0 ? '#/input/p/' + pages[idx - 1].printed : '#/input/ch/' + ch}">‹ 前</a><a class="btn sub" href="${idx < pages.length - 1 ? '#/input/p/' + pages[idx + 1].printed : '#/input/ch/' + ch}">次 ›</a></div>`;
@@ -381,6 +507,7 @@ document.addEventListener('click', async ev => {
   if (a === 'field') { await saveProg(b.dataset.id, { [b.dataset.field]: isNaN(+b.dataset.v) ? b.dataset.v : +b.dataset.v }); return render(); }
   if (a === 'rquick') { const n = +b.dataset.n; await saveProg(b.dataset.id, { reviewDate: n ? addDays(n) : '' }); return render(); }
   if (a === 'rawtoggle') { SET.rawView = !SET.rawView; await db.put('settings', 'rawView', SET.rawView); return render(); }
+  if (a === 'fig-zoom') { openFigZoom(b); return; }
   if (a === 'pick-pack') return $('#packfile').click();
   if (a === 'pick-restore') return $('#restorefile').click();
   if (a === 'persist') { const ok = await navigator.storage?.persist?.(); alert(ok ? '許可されました' : '許可されませんでした(ホーム画面に追加すると通りやすくなります)'); return render(); }
@@ -420,8 +547,26 @@ async function importPack(files) {
   try {
     // 事前チェック: 保存場所が使える状態かを最初に1回だけ確かめる。ダメなら展開まで進まず、再読み込みを案内する。
     try { await db.get('pack', 'manifest.json'); } catch (e) { return msg('packmsg', '保存場所の確認ができませんでした（' + e.message + '）。ページを再読み込みしてから、もう一度取り込んでください。'); }
-    msg('packmsg', '読み込み中…'); let n = 0; const take = async (name, text) => { const base = name.split('/').pop(); if (!base.endsWith('.json') || base.startsWith('.')) return; JSON.parse(text); await db.put('pack', base, JSON.parse(text)); n++; };
-    for (const f of files) { if (f.name.endsWith('.zip')) for (const z of await readZip(await f.arrayBuffer())) await take(z.name, z.text()); else await take(f.name, await f.text()); }
+    msg('packmsg', '読み込み中…'); let n = 0;
+    // §3.1/§1.7: .json は現行処理(basenameキー・JSON.parse)を完全維持。img/*.webp はキー=エントリ名そのまま・値=Blob で保存し件数に含める。それ以外は現行どおり無視する
+    const take = async (name, source) => {
+      if (name.startsWith('img/') && name.endsWith('.webp')) {
+        let bytes = null;
+        if (source instanceof Blob) bytes = new Uint8Array(await source.arrayBuffer());
+        else if (source && typeof source.bytes === 'function') bytes = source.bytes();
+        else return; // バイナリとして取得できない経路からは保存しない(text経由で壊れたデータを入れない)
+        if (!(bytes instanceof Uint8Array)) return;
+        await db.put('pack', name, new Blob([bytes], { type: 'image/webp' })); n++; return;
+      }
+      const base = name.split('/').pop(); if (!base.endsWith('.json') || base.startsWith('.')) return;
+      let text;
+      if (source instanceof Blob) text = await source.text();
+      else if (source && typeof source.text === 'function') text = source.text();
+      else if (typeof source === 'string') text = source;
+      else return;
+      JSON.parse(text); await db.put('pack', base, JSON.parse(text)); n++;
+    };
+    for (const f of files) { if (f.name.endsWith('.zip')) for (const z of await readZip(await f.arrayBuffer())) await take(z.name, z); else await take(f.name, f); }
     D.st = {}; D.cl = {}; SIDX = null; await loadAll();
     if (!D.ready) return msg('packmsg', `${n}個を保存しましたが manifest.json がありません。ZIP全体を選んでください。`);
     msg('packmsg', `取り込み完了(${n}ファイル)。ホームへ戻ります。`); setTimeout(() => (location.hash = '#/home'), 900);

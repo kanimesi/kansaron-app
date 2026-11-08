@@ -16,7 +16,9 @@ export async function readZip(buf) {
     if (method === 0) bytes = data;
     else if (method === 8) bytes = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
     else throw new Error('未対応の圧縮方式: ' + name);
-    out.push({ name, text: () => dec.decode(bytes) });
+    // text() は従来どおり UTF-8 として復号する。bytes() は §3.1/§1.7 用に追加したバイナリ取得経路で、
+    // WebP 等のバイナリを text() 経由で壊さずに取り出すために使う(コピーを返し、元の展開バッファの共有による書き換えを防ぐ)。
+    out.push({ name, text: () => dec.decode(bytes), bytes: () => bytes.slice() });
   }
   return out;
 }
