@@ -409,8 +409,13 @@ async function importPdf(f) {
   } catch (e) { msg('pdfmsg', '失敗しました: ' + e.message); }
 }
 
+// 保存場所がブロックされた(db.js が知らせる)ら、メニューを開いている間だけ案内を出す。
+addEventListener('kansa-db-blocked', () => { const e = document.getElementById('packmsg'); if (e) e.innerHTML = '<p class="muted">保存場所を開けず待っています。別のタブやホーム画面のアイコンなど、他でこのアプリを開いていたら、そちらを閉じてから再読み込みしてください。</p>'; });
+
 async function importPack(files) {
   try {
+    // 事前チェック: 保存場所が使える状態かを最初に1回だけ確かめる。ダメなら展開まで進まず、再読み込みを案内する。
+    try { await db.get('pack', 'manifest.json'); } catch (e) { return msg('packmsg', '保存場所の確認ができませんでした（' + e.message + '）。ページを再読み込みしてから、もう一度取り込んでください。'); }
     msg('packmsg', '読み込み中…'); let n = 0; const take = async (name, text) => { const base = name.split('/').pop(); if (!base.endsWith('.json') || base.startsWith('.')) return; JSON.parse(text); await db.put('pack', base, JSON.parse(text)); n++; };
     for (const f of files) { if (f.name.endsWith('.zip')) for (const z of await readZip(await f.arrayBuffer())) await take(z.name, z.text()); else await take(f.name, await f.text()); }
     D.st = {}; D.cl = {}; SIDX = null; await loadAll();
