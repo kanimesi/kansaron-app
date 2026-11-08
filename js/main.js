@@ -15,6 +15,10 @@ let PR = {}, CK = {}, NT = {}, AT = {}, SET = {}, RV = {}, PDFS = {};
 // 検証状態(論点ごと・本人の確認)。初期値は一律「実装済み」。内容を確認した本人が「検証済み」に上げる。
 const VSTATE = ['実装済み', '検証済み'];
 const vstate = id => PR[id]?.vstate || '実装済み';
+// 「PDFを選ぶ」で押された巻の受け渡し用(モジュール変数のみで受け渡す)。
+// iOS Safari は「ボタンを押した直後の同期的処理」でないとファイル選択を開かないため、
+// クリック→ input.click() の間に await(DB書き込み等)を挟んではいけない。
+let pdfPickBook = null;
 // 端末内に取り込んだ教材PDF(files store)。Input原文の章で使う巻と、過去問(Output)用。
 const PDF_BOOKS = [
   { key: 'input1', label: 'Input編1（上巻・第1〜3章）' },
@@ -285,7 +289,7 @@ async function menu(args = []) {
   <a class="row" href="#/menu/log"><div class="main">📊 学習記録<div class="sub">章ごとの進み・演習の記録</div></div>›</a>
   <div class="card"><h2>教材データの取り込み</h2>
    ${m ? `<p class="muted">取り込み済み: ${esc(m.generatedAt)} 版 / 論点${m.counts.topics}・Input${m.counts.inputPages}頁・過去問${m.counts.exams}問<br>状態: ${esc(m.status)}</p>` : '<p>まだ取り込まれていません。</p>'}
-   <input type="file" id="packfile" accept=".zip,.json" multiple hidden>
+   <input type="file" id="packfile" accept=".zip,.json" multiple class="visually-hidden" aria-hidden="true" tabindex="-1">
    <button class="btn" data-act="pick-pack">ZIP(またはJSON)を選ぶ</button>
    <p class="muted">教材データは、この端末の中だけに保存されます(外部へ送信されません)。</p><div id="packmsg"></div></div>
   <div class="card"><h2>教材PDFの取り込み（原本表示用）</h2>
@@ -293,12 +297,12 @@ async function menu(args = []) {
    ${PDF_BOOKS.map(b => `<div style="margin:6px 0"><span>${esc(b.label)}</span><br>
      ${PDFS[b.key]?.blob ? `<span class="chip">取り込み済み: ${esc(PDFS[b.key].name || '')}${PDFS[b.key].size ? '（' + Math.round(PDFS[b.key].size / 1024) + 'KB）' : ''}</span> <button class="btn sub" data-act="open-pdf" data-book="${b.key}">開く</button> <button class="btn ng" data-act="del-pdf" data-book="${b.key}">削除</button>`
        : `<button class="btn sub" data-act="pick-pdf" data-book="${b.key}">PDFを選ぶ</button>`}</div>`).join('')}
-   <input type="file" id="pdffile" accept="application/pdf,.pdf" hidden>
+   <input type="file" id="pdffile" accept="application/pdf,.pdf" class="visually-hidden" aria-hidden="true" tabindex="-1">
    <div id="pdfmsg"></div></div>
   <div class="card"><h2>バックアップ(自分の学習記録)</h2>
    <p class="muted">進捗・チェック・メモ・演習記録・検証状態・要確認の対応状態を1つのファイルに書き出します。端末の保存領域はiOSに消されることがあるため、定期的な書き出しをおすすめします。教材本文と取り込んだPDFは含まれません。</p>
    <button class="btn" data-act="export">書き出す</button>
-   <input type="file" id="restorefile" accept=".json" hidden><button class="btn sub" data-act="pick-restore">復元する</button><div id="bkmsg"></div></div>
+   <input type="file" id="restorefile" accept=".json" class="visually-hidden" aria-hidden="true" tabindex="-1"><button class="btn sub" data-act="pick-restore">復元する</button><div id="bkmsg"></div></div>
   <div class="card"><h2>保存の安全性</h2><p class="muted">端末の保存を「消されにくく」する申請: ${persisted === null ? '未対応' : persisted ? '許可されています' : 'まだ許可されていません'}</p>
    <button class="btn sub" data-act="persist">申請する</button></div>
   ${m ? `<div class="card"><h2>教材データについての注意</h2><ul class="muted">${m.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></div>` : ''}`;
@@ -368,7 +372,7 @@ document.addEventListener('click', async ev => {
     if (n.startsWith('ev')) { b.parentElement.querySelectorAll('button').forEach(x => x.classList.remove('on')); b.classList.add('on'); return; } F[n] = n === 'cch' ? +b.dataset.v.replace(/\D/g, '') : b.dataset.v; return render(); }
   if (a === 'vstate') { const v = b.dataset.v; await saveProg(b.dataset.id, v === '検証済み' ? { vstate: v, vAt: new Date().toISOString() } : { vstate: v, vAt: '' }); return render(); }
   if (a === 'rvdone') { const id = b.dataset.id; const cur = RV[id]?.done; RV[id] = cur ? { done: false } : { done: true, at: new Date().toISOString() }; await db.put('review', id, RV[id]); return render(); }
-  if (a === 'pick-pdf') { SET._pdfBook = b.dataset.book; await db.put('settings', '_pdfBook', SET._pdfBook); return $('#pdffile').click(); }
+  if (a === 'pick-pdf') { pdfPickBook = b.dataset.book; return $('#pdffile').click(); }
   if (a === 'open-pdf') { openPdf(b.dataset.book, b.dataset.page ? +b.dataset.page : null); return; }
   if (a === 'del-pdf') { if (!confirm('この端末に取り込んだPDFを削除します。よろしいですか?')) return; await db.del('files', b.dataset.book); await loadAll(); return render(); }
   if (a === 'qh') { SET.q = b.dataset.v; await db.put('settings', 'q', SET.q); return render(); }
@@ -402,7 +406,7 @@ document.addEventListener('change', async ev => {
 async function importPdf(f) {
   try {
     if (!f) return;
-    const book = SET._pdfBook || 'input1';
+    const book = pdfPickBook || 'input1'; pdfPickBook = null;
     if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') return msg('pdfmsg', 'PDFファイルを選んでください。');
     await db.put('files', book, { name: f.name, size: f.size, importedAt: new Date().toISOString(), blob: f });
     await loadAll(); msg('pdfmsg', `取り込みました: ${f.name}`); render();
