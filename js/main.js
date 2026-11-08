@@ -133,13 +133,13 @@ async function inputPage(printed) {
     <div class="seg" style="margin-top:8px">${STATUS.map(s => `<button data-act="status" data-id="${i.id}" data-v="${s}" class="${prog(i.id).status === s ? 'on' : ''}">${s}</button>`).join('')}</div>
     <a class="btn sub" href="#/ron/t/${i.id}">論点の詳細</a></div>`).join('')}
   <div class="pager"><a class="btn sub" href="${idx > 0 ? '#/input/p/' + pages[idx - 1].printed : '#/input/ch/' + ch}">‹ 前</a><a class="btn sub" href="${idx < pages.length - 1 ? '#/input/p/' + pages[idx + 1].printed : '#/input/ch/' + ch}">次 ›</a></div>
+  <div class="card"><h2>原本PDFで見る</h2>
+  ${hasPdf ? `<p class="muted">この頁は ${esc(PDF_BOOKS.find(b => b.key === book).label)} のPDF ${pg.pdf}頁です。開いた先でページ指定が効かない端末では、先頭から開きます（その場合は ${pg.pdf}頁へ移動してください）。</p><button class="btn" data-act="open-pdf" data-book="${book}" data-page="${pg.pdf}">PDF ${pg.pdf}頁を開く</button>`
+    : `<p class="muted">まだ教材PDFが取り込まれていません。「メニュー」→「教材PDFの取り込み」で ${esc(PDF_BOOKS.find(b => b.key === book).label)} のPDFを取り込むと、この頁を原本のまま開けます。</p><a class="btn sub" href="#/menu">メニューへ</a>`}</div>
   <p><span class="label">教材原文</span><span class="muted">${printed}(PDF ${pg.pdf}頁)・${idx + 1}/${pages.length}</span>
   <button class="btn sub" data-act="rawtoggle" style="float:right;margin:0;padding:4px 10px;font-size:13px">${raw ? '整形表示へ' : 'そのまま表示'}</button></p>
   <div class="src">${esc(raw ? pg.raw : pg.text)}</div>
   <p class="muted">※抽出テキストです。図表は崩れることがあります。正確さが必要なときは原本PDFで確認してください。</p>
-  <div class="card"><h2>原本PDFで見る</h2>
-  ${hasPdf ? `<p class="muted">この頁は ${esc(PDF_BOOKS.find(b => b.key === book).label)} のPDF ${pg.pdf}頁です。開いた先でページ指定が効かない端末では、先頭から開きます（その場合は ${pg.pdf}頁へ移動してください）。</p><button class="btn" data-act="open-pdf" data-book="${book}" data-page="${pg.pdf}">PDF ${pg.pdf}頁を開く</button>`
-    : `<p class="muted">まだ教材PDFが取り込まれていません。「メニュー」→「教材PDFの取り込み」で ${esc(PDF_BOOKS.find(b => b.key === book).label)} のPDFを取り込むと、この頁を原本のまま開けます。</p><a class="btn sub" href="#/menu">メニューへ</a>`}</div>
   <div class="card"><h2><span class="label ai" style="background:var(--navy)">自分のメモ</span></h2><textarea data-act="note" data-key="page:${printed}" placeholder="この頁のメモ">${esc(nt)}</textarea></div>
   <div class="pager"><a class="btn sub" href="${idx > 0 ? '#/input/p/' + pages[idx - 1].printed : '#/input/ch/' + ch}">‹ 前</a><a class="btn sub" href="${idx < pages.length - 1 ? '#/input/p/' + pages[idx + 1].printed : '#/input/ch/' + ch}">次 ›</a></div>`;
 }
