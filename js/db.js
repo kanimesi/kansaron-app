@@ -1,6 +1,8 @@
 // IndexedDB(端末内の保存場所)の薄い道具。教材データ(pack)と個人データ(その他)を別の入れ物に分けている。
-const NAME = 'kansa', VER = 1;
-const STORES = ['pack', 'progress', 'checks', 'notes', 'attempts', 'settings'];
+// VER=2: 要確認の対応状態(review)と、端末内に取り込んだ教材PDF(files)の入れ物を追加。
+// 既存の入れ物は「無ければ作る」だけなので、VER=1 で保存した学習記録はそのまま残る。
+const NAME = 'kansa', VER = 2;
+const STORES = ['pack', 'progress', 'checks', 'notes', 'attempts', 'settings', 'review', 'files'];
 let dbp;
 function open() {
   if (!dbp) dbp = new Promise((res, rej) => {
@@ -20,4 +22,5 @@ export async function all(s) {
   return new Promise((res, rej) => { const o = {}; const t = d.transaction(s, 'readonly'); const c = t.objectStore(s).openCursor();
     c.onsuccess = () => { const cur = c.result; if (cur) { o[cur.key] = cur.value; cur.continue(); } else res(o); }; c.onerror = () => rej(c.error); });
 }
-export const PERSONAL = ['progress', 'checks', 'notes', 'attempts', 'settings'];
+// バックアップ対象の個人データ。files(取り込んだ教材PDF本体)は教材そのものなので含めない(端末ごとに取り込み直す)。
+export const PERSONAL = ['progress', 'checks', 'notes', 'attempts', 'settings', 'review'];
