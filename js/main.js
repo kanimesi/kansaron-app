@@ -1,5 +1,6 @@
 import * as db from './db.js';
 import { readZip } from './zip.js';
+import { extractAnki } from './anki.js';
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -407,10 +408,12 @@ async function menu(args = []) {
   if (args[0] === 'search') return search();
   if (args[0] === 'review') return review();
   if (args[0] === 'log') return logView();
+  if (args[0] === 'anki') return ankiView();
   setTitle('メニュー');
   const m = D.manifest; const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : null;
   return `
   <a class="row" href="#/menu/search"><div class="main">🔍 教材検索<div class="sub">Input・過去問・論点リストを横断して検索</div></div>›</a>
+  <a class="row" href="#/menu/anki"><div class="main">🌑 暗記マーク集<div class="sub">Inputの🌑が付いた見出しと原文を章ごとに一覧</div></div>›</a>
   <a class="row" href="#/menu/review"><div class="main">🔁 復習リスト<div class="sub">復習予定日の一覧と更新</div></div>›</a>
   <a class="row" href="#/menu/log"><div class="main">📊 学習記録<div class="sub">章ごとの進み・演習の記録</div></div>›</a>
   <div class="card"><h2>教材データの取り込み</h2>
@@ -489,11 +492,36 @@ async function logView() {
    ${att.slice(0, 20).map(a => `<a class="row" href="#/output/e/${a.id}"><div class="main">${esc(a.date)} 過去問${a.id}<div class="sub">${a.subs.map(s => s.eval).join(' ')} ${esc(a.memo || '')}</div></div>›</a>`).join('') || '<p class="muted">まだ記録がありません。</p>'}</div>`;
 }
 
+// ---------- 暗記マーク集 ----------
+let ANKI;
+async function ankiAll() { if (ANKI) return ANKI; ANKI = []; for (let c = 1; c <= 10; c++) for (const a of extractAnki(await chapterPages(c))) ANKI.push({ ...a, ch: c, key: `anki:${a.printed}:${a.n}` }); return ANKI; }
+async function ankiView() {
+  setTitle('暗記マーク集', '#/menu');
+  if (!D.ready) return needPack();
+  const all = await ankiAll(), ch = SET.ach || '全部', only = SET.aonly || '全部';
+  const done = a => !!CK[a.key]?.recalled;
+  const list = all.filter(a => (ch === '全部' || a.ch === +ch) && (only === '全部' || !done(a)));
+  let h = `<div class="card"><h2>Inputの🌑(暗記マーク) ${all.length}か所</h2><div class="bar"><div style="width:${all.filter(done).length / all.length * 100}%"></div></div>
+   <p class="muted">覚えた ${all.filter(done).length} / ${all.length}。見出しをタップすると、その直後の教材原文が開きます(頁内の範囲を機械的に区切っているため、図表の位置によっては前後がずれることがあります)。</p></div>`;
+  h += `<p class="muted" style="margin-bottom:2px">章</p>` + seg('ach', ['全部', ...D.structure.chapters.map(c => c.ch)], ch) + `<p></p>` + seg('aonly', ['全部', '未暗記のみ'], only) + `<p class="muted">${list.length}件</p>`;
+  let cur = '';
+  for (const a of list) {
+    if (a.ch !== cur) { cur = a.ch; h += `<h3 style="color:var(--navy);margin:16px 0 6px">第${cur}章 ${esc(D.structure.chapters[cur - 1].title)}</h3>`; }
+    h += `<details class="card" style="padding:8px 12px"><summary style="list-style:none;display:flex;gap:10px;align-items:flex-start">
+      <input type="checkbox" data-act="ankick" data-key="${a.key}" ${done(a) ? 'checked' : ''} onclick="event.stopPropagation()" style="width:22px;height:22px;margin-top:3px;flex:none">
+      <div class="main" style="flex:1;min-width:0">${a.parent && a.parent !== a.heading ? `<div class="sub">${esc(a.parent)}</div>` : ''}<b>🌑 ${esc(a.heading)}</b><div class="sub">Input ${a.printed}${a.ref ? ' ・ ' + esc(a.ref) : ''}</div></div></summary>
+      ${a.body ? `<p><span class="label">教材原文</span></p><div class="src">${esc(a.body)}</div>` : '<p class="muted">この見出しの直後に本文がありません(図表や次頁にある場合があります)。頁で確認してください。</p>'}
+      <p><a class="btn sub" href="#/input/p/${a.printed}">この頁を開く</a></p></details>`;
+  }
+  return h;
+}
+
 // ---------- イベント ----------
 const msg = (id, t) => { const e = $('#' + id); if (e) e.innerHTML = `<p class="muted">${esc(t)}</p>`; };
 document.addEventListener('click', async ev => {
   const b = ev.target.closest('[data-act]'); if (!b) return; const a = b.dataset.act;
-  if (a === 'seg') { const n = b.dataset.name; if (n === 'qk') { SET.qk = b.dataset.v; await db.put('settings', 'qk', SET.qk); return render(); }
+  if (a === 'seg') { const n = b.dataset.name; if (n === 'ach' || n === 'aonly') { SET[n] = b.dataset.v; await db.put('settings', n, b.dataset.v); return render(); }
+    if (n === 'qk') { SET.qk = b.dataset.v; await db.put('settings', 'qk', SET.qk); return render(); }
     if (n === 'rst') { RF.st = b.dataset.v; return render(); }
     if (n.startsWith('ev')) { b.parentElement.querySelectorAll('button').forEach(x => x.classList.remove('on')); b.classList.add('on'); return; } F[n] = n === 'cch' ? +b.dataset.v.replace(/\D/g, '') : b.dataset.v; return render(); }
   if (a === 'vstate') { const v = b.dataset.v; await saveProg(b.dataset.id, v === '検証済み' ? { vstate: v, vAt: new Date().toISOString() } : { vstate: v, vAt: '' }); return render(); }
@@ -521,6 +549,7 @@ document.addEventListener('click', async ev => {
 });
 document.addEventListener('change', async ev => {
   const t = ev.target; const a = t.dataset?.act;
+  if (a === 'ankick') { CK[t.dataset.key] = t.checked ? { recalled: true, at: new Date().toISOString() } : { recalled: false }; await db.put('checks', t.dataset.key, CK[t.dataset.key]); const y = scrollY, o = [...document.querySelectorAll('details[open]')].map(d => d.querySelector('[data-key]')?.dataset.key); await render(); document.querySelectorAll('details').forEach(d => o.includes(d.querySelector('[data-key]')?.dataset.key) && (d.open = true)); scrollTo(0, y); return; }
   if (a === 'ck') { CK[t.dataset.id] = t.checked ? { recalled: true, at: new Date().toISOString() } : { recalled: false }; await db.put('checks', t.dataset.id, CK[t.dataset.id]); return render(); }
   if (a === 'rdate') { await saveProg(t.dataset.id, { reviewDate: t.value }); return; }
   if (a === 'note') { NT[t.dataset.key] = t.value; return db.put('notes', t.dataset.key, t.value); }
@@ -567,7 +596,7 @@ async function importPack(files) {
       JSON.parse(text); await db.put('pack', base, JSON.parse(text)); n++;
     };
     for (const f of files) { if (f.name.endsWith('.zip')) for (const z of await readZip(await f.arrayBuffer())) await take(z.name, z); else await take(f.name, f); }
-    D.st = {}; D.cl = {}; SIDX = null; await loadAll();
+    D.st = {}; D.cl = {}; SIDX = null; ANKI = null; await loadAll();
     if (!D.ready) return msg('packmsg', `${n}個を保存しましたが manifest.json がありません。ZIP全体を選んでください。`);
     msg('packmsg', `取り込み完了(${n}ファイル)。ホームへ戻ります。`); setTimeout(() => (location.hash = '#/home'), 900);
   } catch (e) { msg('packmsg', '失敗しました: ' + e.message); }
