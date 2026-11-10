@@ -104,7 +104,13 @@ async function home() {
   const uniq = []; const seen = new Set(); menu.forEach(m => { if (!seen.has(m.href + m.why)) { seen.add(m.href + m.why); uniq.push(m); } });
   const rvTotal = (D.review || []).length, rvOpen = (D.review || []).filter(r => !RV[r.id]?.done).length;
   const vsDone = D.items.filter(i => vstate(i.id) === '検証済み').length;
+  // 暗記マーク集への導線(カード全体がタップ領域)。件数・進捗は ankiAll() と checks(CK) の実データから出す
+  const anki = await ankiAll();
+  const ankiDone = anki.filter(a => !!CK[a.key]?.recalled).length, ankiTotal = anki.length;
   return `
+  <a class="row" href="#/menu/anki" style="display:block;padding:14px"><div style="display:flex;align-items:center;gap:10px"><div class="main"><b style="font-size:16px;color:var(--navy)">🌑 暗記マーク集</b><div class="sub">Inputの🌑が付いた見出しと原文を章ごとに一覧</div></div><span aria-hidden="true" style="font-size:18px;color:var(--mu)">›</span></div>
+    <div class="bar" style="margin:8px 0 6px"><div style="width:${ankiTotal ? ankiDone / ankiTotal * 100 : 0}%"></div></div>
+    <div class="muted">覚えた ${ankiDone} / ${ankiTotal}${ankiTotal ? ` ・ 未暗記 ${ankiTotal - ankiDone} 件` : ''}</div></a>
   <div class="card"><h2>学習の進み(論点 ${total} 項目)</h2>
     <div class="bar"><div style="width:${(done / total * 100).toFixed(1)}%"></div></div>
     <p class="muted">着手済み ${done} / ${total}　${STATUS.map(s => `<span class="chip">${s} ${cnt[s]}</span>`).join('')}</p>
@@ -494,6 +500,9 @@ async function logView() {
 
 // ---------- 暗記マーク集 ----------
 let ANKI;
+// 一問一答モードの作業状態。位置・モードは画面遷移でリセットされてよい(永続化しない)のでモジュール変数だけに持つ。
+// seq は対象セットのキー(フィルタ条件)を表し、条件が変わったら検出して新しいセットでシャッフルし直す。
+let AQ = { mode: '一覧', seq: '', items: [], idx: 0, show: false };
 async function ankiAll() { if (ANKI) return ANKI; ANKI = []; for (let c = 1; c <= 10; c++) for (const a of extractAnki(await chapterPages(c))) ANKI.push({ ...a, ch: c, key: `anki:${a.printed}:${a.n}` }); return ANKI; }
 async function ankiView() {
   setTitle('暗記マーク集', '#/menu');
@@ -503,7 +512,9 @@ async function ankiView() {
   const list = all.filter(a => (ch === '全部' || a.ch === +ch) && (only === '全部' || !done(a)));
   let h = `<div class="card"><h2>Inputの🌑(暗記マーク) ${all.length}か所</h2><div class="bar"><div style="width:${all.filter(done).length / all.length * 100}%"></div></div>
    <p class="muted">覚えた ${all.filter(done).length} / ${all.length}。見出しをタップすると、その直後の教材原文が開きます(頁内の範囲を機械的に区切っているため、図表の位置によっては前後がずれることがあります)。</p></div>`;
+  h += `<p class="muted" style="margin-bottom:2px">表示</p>` + seg('amode', ['一覧', '一問一答'], AQ.mode) + '<p></p>';
   h += `<p class="muted" style="margin-bottom:2px">章</p>` + seg('ach', ['全部', ...D.structure.chapters.map(c => c.ch)], ch) + `<p></p>` + seg('aonly', ['全部', '未暗記のみ'], only) + `<p class="muted">${list.length}件</p>`;
+  if (AQ.mode === '一問一答') return h + ankiQuizHtml(list);
   let cur = '';
   for (const a of list) {
     if (a.ch !== cur) { cur = a.ch; h += `<h3 style="color:var(--navy);margin:16px 0 6px">第${cur}章 ${esc(D.structure.chapters[cur - 1].title)}</h3>`; }
@@ -515,16 +526,56 @@ async function ankiView() {
   }
   return h;
 }
+// 一問一答モード(シャッフル)。対象は呼び出し時点のフィルタ結果 list。
+// 状態 AQ は、対象セットのキー(章・未暗記のみ・対象キー列)から作る seq で管理し、
+// フィルタ変更や「暗記した」で付けたチェックで対象が変わったら、新しいセットでシャッフルし直す。
+function ankiQuizHtml(list) {
+  const done = a => !!CK[a.key]?.recalled;
+  const seq = `${SET.ach || '全部'}|${SET.aonly || '全部'}|${list.map(a => a.key).join(',')}`;
+  if (AQ.seq !== seq) {
+    const items = list.slice();
+    for (let i = items.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [items[i], items[j]] = [items[j], items[i]]; }
+    AQ = { mode: AQ.mode, seq, items, idx: 0, show: false };
+  }
+  const items = AQ.items, total = items.length;
+  if (!total) return '<p class="muted">この条件に合う暗記マークはありません。</p>';
+  if (AQ.idx >= total) {
+    const all = ANKI || [];
+    return `<div class="card"><h2>最後まで終わりました</h2>
+     <p class="muted">この条件の ${total} 件を一通り見ました。覚えた ${all.filter(done).length} / ${all.length}（全体）。</p>
+     <p><button class="btn" data-act="aq-reshuffle">もう一度シャッフル</button> <button class="btn sub" data-act="aq-tolist">一覧に戻る</button></p></div>`;
+  }
+  const a = items[AQ.idx], isDone = done(a);
+  let h = `<div class="pager"><button class="btn sub" data-act="aq-prev" ${AQ.idx === 0 ? 'disabled style="opacity:.45"' : ''}>‹ 前へ</button><span class="muted" style="align-self:center">${AQ.idx + 1} / ${total}</span><button class="btn sub" data-act="aq-next" ${AQ.idx >= total - 1 ? 'disabled style="opacity:.45"' : ''}>次へ ›</button></div>`;
+  h += `<div class="card">${a.parent && a.parent !== a.heading ? `<div class="sub">${esc(a.parent)}</div>` : ''}<div style="font-size:17px;margin:2px 0"><b>🌑 ${esc(a.heading)}</b></div>
+   <div class="sub">第${a.ch}章 ・ Input ${a.printed}${a.ref ? ' ・ ' + esc(a.ref) : ''}${isDone ? ' ・ <span class="chip" style="background:#e3f4ea;border-color:#a9dcbc">暗記済み</span>' : ''}</div>
+   ${AQ.show ? (a.body ? `<p><span class="label">教材原文</span></p><div class="src">${esc(a.body)}</div>` : '<p class="muted">この見出しの直後に本文がありません(図表や次頁にある場合があります)。頁で確認してください。</p>')
+     : '<p><button class="btn sub" data-act="aq-show">原文を表示</button></p>'}
+   <p style="margin-top:10px">${isDone
+     ? '<button class="btn ng" data-act="aq-unmark" style="margin-right:8px">まだ（未暗記に戻す）</button>'
+     : '<button class="btn" data-act="aq-done" style="margin-right:8px">暗記した</button><button class="btn sub" data-act="aq-skip">まだ</button>'}</p>
+   <p><a class="btn sub" href="#/input/p/${a.printed}">この頁を開く</a></p></div>`;
+  return h;
+}
 
 // ---------- イベント ----------
 const msg = (id, t) => { const e = $('#' + id); if (e) e.innerHTML = `<p class="muted">${esc(t)}</p>`; };
 document.addEventListener('click', async ev => {
   const b = ev.target.closest('[data-act]'); if (!b) return; const a = b.dataset.act;
-  if (a === 'seg') { const n = b.dataset.name; if (n === 'ach' || n === 'aonly') { SET[n] = b.dataset.v; await db.put('settings', n, b.dataset.v); return render(); }
+  if (a === 'seg') { const n = b.dataset.name; if (n === 'amode') { AQ.mode = b.dataset.v; AQ.seq = ''; AQ.idx = 0; AQ.show = false; return render(); }
+    if (n === 'ach' || n === 'aonly') { SET[n] = b.dataset.v; await db.put('settings', n, b.dataset.v); return render(); }
     if (n === 'qk') { SET.qk = b.dataset.v; await db.put('settings', 'qk', SET.qk); return render(); }
     if (n === 'rst') { RF.st = b.dataset.v; return render(); }
     if (n.startsWith('ev')) { b.parentElement.querySelectorAll('button').forEach(x => x.classList.remove('on')); b.classList.add('on'); return; } F[n] = n === 'cch' ? +b.dataset.v.replace(/\D/g, '') : b.dataset.v; return render(); }
   if (a === 'vstate') { const v = b.dataset.v; await saveProg(b.dataset.id, v === '検証済み' ? { vstate: v, vAt: new Date().toISOString() } : { vstate: v, vAt: '' }); return render(); }
+  if (a === 'aq-show') { AQ.show = !AQ.show; return render(); }
+  if (a === 'aq-prev') { if (AQ.idx > 0) { AQ.idx--; AQ.show = false; } return render(); }
+  if (a === 'aq-next') { if (AQ.idx < AQ.items.length - 1) { AQ.idx++; AQ.show = false; } return render(); }
+  if (a === 'aq-skip') { AQ.idx++; AQ.show = false; return render(); }
+  if (a === 'aq-done') { const it = AQ.items[AQ.idx]; if (it) { CK[it.key] = { recalled: true, at: new Date().toISOString() }; await db.put('checks', it.key, CK[it.key]); AQ.idx++; AQ.show = false; } return render(); }
+  if (a === 'aq-unmark') { const it = AQ.items[AQ.idx]; if (it) { CK[it.key] = { recalled: false }; await db.put('checks', it.key, CK[it.key]); AQ.idx++; AQ.show = false; } return render(); }
+  if (a === 'aq-reshuffle') { AQ.seq = ''; AQ.idx = 0; AQ.show = false; return render(); }
+  if (a === 'aq-tolist') { AQ.mode = '一覧'; AQ.seq = ''; AQ.idx = 0; AQ.show = false; return render(); }
   if (a === 'rvdone') { const id = b.dataset.id; const cur = RV[id]?.done; RV[id] = cur ? { done: false } : { done: true, at: new Date().toISOString() }; await db.put('review', id, RV[id]); return render(); }
   if (a === 'pick-pdf') { pdfPickBook = b.dataset.book; return $('#pdffile').click(); }
   if (a === 'open-pdf') { openPdf(b.dataset.book, b.dataset.page ? +b.dataset.page : null); return; }
