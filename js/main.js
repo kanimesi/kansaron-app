@@ -187,19 +187,17 @@ async function renderInsert(ins, urls, atTail) {
   }
   return `<div class="insert"><img class="fig-img" data-act="fig-zoom" src="${esc(url)}" alt="${esc(e.alt || '')}"><p class="insert-cap">${esc(cap)}</p></div>`;
 }
-async function buildFormattedBody(pg) {
+// §3.3: カーソル方式のアンカー解決。order 順に、前回位置より後ろから前方検索する(afterOccurrence 対応)。
+// 戻り値の resolved は {ins, pos(差し込み位置=アンカー末尾), anchorFrom(アンカー先頭), top}、tail は位置を特定できなかったもの。
+// Input頁の buildFormattedBody と、暗記マーク集の buildAnkiBodyHtml が共用する。
+function resolveInserts(pg) {
   const text = String(pg.text ?? '');
   const inserts = collectInserts(pg);
-  if (!inserts.length) return `<div class="src">${esc(text)}</div>`;
-  // この頁の fig 分だけ Blob URL を用意する(§3.1-3)
-  const urls = {};
-  for (const ins of inserts) if (ins.kind === 'fig' && ins.entry.src && !(ins.entry.src in urls)) urls[ins.entry.src] = await figUrl(ins.entry.src);
-  // §3.3: カーソル方式。order 順に、前回位置より後ろから前方検索する(afterOccurrence 対応)
   const resolved = [], tail = [];
   let cursor = 0;
   for (const ins of inserts) {
     const e = ins.entry, after = typeof e.after === 'string' ? e.after : null;
-    if (after === '' && e.position === 'top') { resolved.push({ ins, pos: 0 }); continue; }
+    if (after === '' && e.position === 'top') { resolved.push({ ins, pos: 0, anchorFrom: 0, top: true }); continue; }
     if (!after) { tail.push(ins); continue; }
     const want = Number.isInteger(e.afterOccurrence) && e.afterOccurrence >= 0 ? e.afterOccurrence : 0;
     let pos = cursor, found = -1;
@@ -211,10 +209,20 @@ async function buildFormattedBody(pg) {
     }
     if (found < 0) { tail.push(ins); continue; }
     const at = found + after.length;
-    resolved.push({ ins, pos: at });
+    resolved.push({ ins, pos: at, anchorFrom: found, top: false });
     if (at > cursor) cursor = at;
   }
   resolved.sort((a, b) => a.pos - b.pos || a.ins.order - b.ins.order);
+  return { resolved, tail };
+}
+async function buildFormattedBody(pg) {
+  const text = String(pg.text ?? '');
+  const inserts = collectInserts(pg);
+  if (!inserts.length) return `<div class="src">${esc(text)}</div>`;
+  // この頁の fig 分だけ Blob URL を用意する(§3.1-3)
+  const urls = {};
+  for (const ins of inserts) if (ins.kind === 'fig' && ins.entry.src && !(ins.entry.src in urls)) urls[ins.entry.src] = await figUrl(ins.entry.src);
+  const { resolved, tail } = resolveInserts(pg);
   const parts = [];
   let prev = 0;
   for (const r of resolved) {
@@ -504,6 +512,40 @@ let ANKI;
 // seq は対象セットのキー(フィルタ条件)を表し、条件が変わったら検出して新しいセットでシャッフルし直す。
 let AQ = { mode: '一覧', seq: '', items: [], idx: 0, show: false };
 async function ankiAll() { if (ANKI) return ANKI; ANKI = []; for (let c = 1; c <= 10; c++) for (const a of extractAnki(await chapterPages(c))) ANKI.push({ ...a, ch: c, key: `anki:${a.printed}:${a.n}` }); return ANKI; }
+// 暗記項目の答え(body)の中に、その項目の範囲内にある表・図だけを差し込む。
+// 範囲判定: anki.js が返す bodyFrom/bodyTo(親頁 text の文字位置)と、頁のアンカー解決位置(resolveInserts)の照合。
+// アンカー(after の出現区間)が範囲に完全に収まるものだけを差し込み、境界にかかるものは差し込まず案内文を出す(保守的扱い)。
+// 位置を特定できなかった頁末尾分(tail)は、どの項目の範囲か分からないため対象にしない。テキスト自体は変えない(二重表示は U3 と同じ方針)。
+async function buildAnkiBodyHtml(a, pg) {
+  const plain = `<div class="src">${esc(a.body)}</div>`;
+  if (!pg || !Number.isInteger(a.bodyFrom) || !Number.isInteger(a.bodyTo)) return plain;
+  if (!collectInserts(pg).length) return plain;
+  const { resolved } = resolveInserts(pg);
+  const inside = [], straddle = [];
+  for (const r of resolved) {
+    if (r.top) continue; // 頁先頭の差し込みは項目の範囲とはみなさない
+    if (r.anchorFrom >= a.bodyFrom && r.pos <= a.bodyTo) inside.push(r);
+    else if (r.anchorFrom < a.bodyTo && r.pos > a.bodyFrom) straddle.push(r);
+  }
+  if (!inside.length && !straddle.length) return plain;
+  const notice = straddle.length ? `<p class="muted">※この見出しの範囲には表・図がありますが、ここでは正確な位置に表示できませんでした。下の「この頁を開く」から原本の表示で確認してください。</p>` : '';
+  if (!inside.length) return plain + notice;
+  // この項目で使う fig 分だけ Blob URL を用意する(§3.1-3 と同じ)
+  const urls = {};
+  for (const r of inside) if (r.ins.kind === 'fig' && r.ins.entry.src && !(r.ins.entry.src in urls)) urls[r.ins.entry.src] = await figUrl(r.ins.entry.src);
+  const text = String(pg.text ?? '');
+  const parts = [];
+  let prev = a.bodyFrom;
+  for (const r of inside) {
+    const frag = text.slice(prev, r.pos);
+    if (frag.trim()) parts.push(`<div class="src">${esc(frag)}</div>`);
+    parts.push(await renderInsert(r.ins, urls, false));
+    prev = r.pos;
+  }
+  const rest = text.slice(prev, a.bodyTo);
+  if (rest.trim()) parts.push(`<div class="src">${esc(rest)}</div>`);
+  return parts.join('') + notice;
+}
 async function ankiView() {
   setTitle('暗記マーク集', '#/menu');
   if (!D.ready) return needPack();
@@ -514,14 +556,17 @@ async function ankiView() {
    <p class="muted">覚えた ${all.filter(done).length} / ${all.length}。見出しをタップすると、その直後の教材原文が開きます(頁内の範囲を機械的に区切っているため、図表の位置によっては前後がずれることがあります)。</p></div>`;
   h += `<p class="muted" style="margin-bottom:2px">表示</p>` + seg('amode', ['一覧', '一問一答'], AQ.mode) + '<p></p>';
   h += `<p class="muted" style="margin-bottom:2px">章</p>` + seg('ach', ['全部', ...D.structure.chapters.map(c => c.ch)], ch) + `<p></p>` + seg('aonly', ['全部', '未暗記のみ'], only) + `<p class="muted">${list.length}件</p>`;
-  if (AQ.mode === '一問一答') return h + ankiQuizHtml(list);
+  if (AQ.mode === '一問一答') return h + await ankiQuizHtml(list);
+  // 項目の親頁(差し込み判定用)。chapterPages は章単位でキャッシュされるので、頁オブジェクトだけ引く
+  const pgMap = new Map();
+  const pgOf = async a => { const k = a.ch + ':' + a.printed; if (!pgMap.has(k)) pgMap.set(k, (await chapterPages(a.ch)).find(p => p.printed === a.printed) || null); return pgMap.get(k); };
   let cur = '';
   for (const a of list) {
     if (a.ch !== cur) { cur = a.ch; h += `<h3 style="color:var(--navy);margin:16px 0 6px">第${cur}章 ${esc(D.structure.chapters[cur - 1].title)}</h3>`; }
     h += `<details class="card" style="padding:8px 12px"><summary style="list-style:none;display:flex;gap:10px;align-items:flex-start">
       <input type="checkbox" data-act="ankick" data-key="${a.key}" ${done(a) ? 'checked' : ''} onclick="event.stopPropagation()" style="width:22px;height:22px;margin-top:3px;flex:none">
       <div class="main" style="flex:1;min-width:0">${a.parent && a.parent !== a.heading ? `<div class="sub">${esc(a.parent)}</div>` : ''}<b>🌑 ${esc(a.heading)}</b><div class="sub">Input ${a.printed}${a.ref ? ' ・ ' + esc(a.ref) : ''}</div></div></summary>
-      ${a.body ? `<p><span class="label">教材原文</span></p><div class="src">${esc(a.body)}</div>` : '<p class="muted">この見出しの直後に本文がありません(図表や次頁にある場合があります)。頁で確認してください。</p>'}
+      ${a.body ? `<p><span class="label">教材原文</span></p>${await buildAnkiBodyHtml(a, await pgOf(a))}` : '<p class="muted">この見出しの直後に本文がありません(図表や次頁にある場合があります)。頁で確認してください。</p>'}
       <p><a class="btn sub" href="#/input/p/${a.printed}">この頁を開く</a></p></details>`;
   }
   return h;
@@ -529,7 +574,7 @@ async function ankiView() {
 // 一問一答モード(シャッフル)。対象は呼び出し時点のフィルタ結果 list。
 // 状態 AQ は、対象セットのキー(章・未暗記のみ・対象キー列)から作る seq で管理し、
 // フィルタ変更や「暗記した」で付けたチェックで対象が変わったら、新しいセットでシャッフルし直す。
-function ankiQuizHtml(list) {
+async function ankiQuizHtml(list) {
   const done = a => !!CK[a.key]?.recalled;
   const seq = `${SET.ach || '全部'}|${SET.aonly || '全部'}|${list.map(a => a.key).join(',')}`;
   if (AQ.seq !== seq) {
@@ -549,7 +594,7 @@ function ankiQuizHtml(list) {
   let h = `<div class="pager"><button class="btn sub" data-act="aq-prev" ${AQ.idx === 0 ? 'disabled style="opacity:.45"' : ''}>‹ 前へ</button><span class="muted" style="align-self:center">${AQ.idx + 1} / ${total}</span><button class="btn sub" data-act="aq-next" ${AQ.idx >= total - 1 ? 'disabled style="opacity:.45"' : ''}>次へ ›</button></div>`;
   h += `<div class="card">${a.parent && a.parent !== a.heading ? `<div class="sub">${esc(a.parent)}</div>` : ''}<div style="font-size:17px;margin:2px 0"><b>🌑 ${esc(a.heading)}</b></div>
    <div class="sub">第${a.ch}章 ・ Input ${a.printed}${a.ref ? ' ・ ' + esc(a.ref) : ''}${isDone ? ' ・ <span class="chip" style="background:#e3f4ea;border-color:#a9dcbc">暗記済み</span>' : ''}</div>
-   ${AQ.show ? (a.body ? `<p><span class="label">教材原文</span></p><div class="src">${esc(a.body)}</div>` : '<p class="muted">この見出しの直後に本文がありません(図表や次頁にある場合があります)。頁で確認してください。</p>')
+   ${AQ.show ? (a.body ? `<p><span class="label">教材原文</span></p>${await buildAnkiBodyHtml(a, (await chapterPages(a.ch)).find(p => p.printed === a.printed) || null)}` : '<p class="muted">この見出しの直後に本文がありません(図表や次頁にある場合があります)。頁で確認してください。</p>')
      : '<p><button class="btn sub" data-act="aq-show">原文を表示</button></p>'}
    <p style="margin-top:10px">${isDone
      ? '<button class="btn ng" data-act="aq-unmark" style="margin-right:8px">まだ（未暗記に戻す）</button>'
