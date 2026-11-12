@@ -136,7 +136,9 @@ async function input(args) {
   }).join('');
 }
 async function inputChapter(ch) {
-  const c = D.structure.chapters.find(x => x.ch === ch); setTitle(`第${ch}章 ${c.title}`, '#/input');
+  const c = D.structure.chapters.find(x => x.ch === ch);
+  if (!c) { setTitle('Input', '#/input'); return `<div class="card"><h2>第${ch}章は見つかりませんでした</h2><p class="muted">指定された章は教材データにありません。章の一覧から開き直してください。</p><a class="btn" href="#/input">Inputの章一覧へ</a></div>`; }
+  setTitle(`第${ch}章 ${c.title}`, '#/input');
   let h = '';
   for (const s of D.structure.sections.filter(s => s.ch === ch)) {
     h += `<h3 style="color:var(--navy);margin:14px 0 6px">第${s.sec}節 ${esc(s.title)}</h3>`;
@@ -187,30 +189,65 @@ async function renderInsert(ins, urls, atTail) {
   }
   return `<div class="insert"><img class="fig-img" data-act="fig-zoom" src="${esc(url)}" alt="${esc(e.alt || '')}"><p class="insert-cap">${esc(cap)}</p></div>`;
 }
-// §3.3: カーソル方式のアンカー解決。order 順に、前回位置より後ろから前方検索する(afterOccurrence 対応)。
+// §3.3: アンカー解決。order 順に、前回位置より後ろから前方検索するカーソル方式が基本(afterOccurrence 対応)。
 // 戻り値の resolved は {ins, pos(差し込み位置=アンカー末尾), anchorFrom(アンカー先頭), top}、tail は位置を特定できなかったもの。
 // Input頁の buildFormattedBody と、暗記マーク集の buildAnkiBodyHtml が共用する。
+//
+// フォールバック(2026-11-11 全面監査 中-1 対応): 生成側の経路Bアンカーでは、アンカーの出現順が order と
+// 逆転している頁(例: ③-3-4。t1 の after が t2 の after より後方にある)があり、先行する差し込みの解決で
+// カーソルが後続のアンカーを通り過ぎてしまう。この型に限り、カーソル方式で解決できなかった差し込みを
+// 「カーソルを無視した独立検索」で再検索し、解決位置で並べ替える。安全条件:
+//  - afterOccurrence が記録されている差し込みは、頁先頭から数えたその出現番号を尊重する。
+//  - 解決済みの差し込みと同一のアンカー範囲になるものは引っ張らない。同一頁に同一範囲の図(fig)がある
+//    表などは、同じ図表の二重表現を本文中へ移動させることになるため(例: ③-3-2/③-5-7/⑩-4-2 は、
+//    同じ after を図と表が共有し、図が正位置にいるので、表は従来どおり頁末尾表示のままにする)。
+//  - フォールバック候補同士でアンカー範囲が重なるものも、正位置を決められないため引っ張らない。
+//  - それでも解決できないものは従来どおり頁末尾(tail)+注記で表示する。
+function findAfterOccurrence(text, after, want, from) {
+  let pos = from, found = -1;
+  for (let k = 0; k <= want; k++) {
+    const idx = text.indexOf(after, pos);
+    if (idx < 0) return -1;
+    found = idx;
+    pos = idx + Math.max(after.length, 1);
+  }
+  return found;
+}
 function resolveInserts(pg) {
   const text = String(pg.text ?? '');
   const inserts = collectInserts(pg);
-  const resolved = [], tail = [];
+  const resolved = [], failed = [];
   let cursor = 0;
   for (const ins of inserts) {
     const e = ins.entry, after = typeof e.after === 'string' ? e.after : null;
     if (after === '' && e.position === 'top') { resolved.push({ ins, pos: 0, anchorFrom: 0, top: true }); continue; }
-    if (!after) { tail.push(ins); continue; }
+    if (!after) { failed.push(ins); continue; }
     const want = Number.isInteger(e.afterOccurrence) && e.afterOccurrence >= 0 ? e.afterOccurrence : 0;
-    let pos = cursor, found = -1;
-    for (let k = 0; k <= want; k++) {
-      const idx = text.indexOf(after, pos);
-      if (idx < 0) { found = -1; break; }
-      found = idx;
-      pos = idx + Math.max(after.length, 1);
-    }
-    if (found < 0) { tail.push(ins); continue; }
+    const found = findAfterOccurrence(text, after, want, cursor);
+    if (found < 0) { failed.push(ins); continue; }
     const at = found + after.length;
     resolved.push({ ins, pos: at, anchorFrom: found, top: false });
     if (at > cursor) cursor = at;
+  }
+  // フォールバック: 失敗した差し込みだけを、カーソルを無視して独立に検索する
+  const usedRanges = new Set(resolved.filter(r => !r.top).map(r => r.anchorFrom + ':' + r.pos));
+  const candByIns = new Map(), rangeCount = new Map();
+  for (const ins of failed) {
+    const e = ins.entry, after = typeof e.after === 'string' ? e.after : null;
+    if (!after) continue;
+    const want = Number.isInteger(e.afterOccurrence) && e.afterOccurrence >= 0 ? e.afterOccurrence : 0;
+    const found = findAfterOccurrence(text, after, want, 0);
+    if (found < 0) continue;
+    const key = found + ':' + (found + after.length);
+    if (usedRanges.has(key)) continue; // 解決済み(図など)と同一範囲 → 二重表現になるため引っ張らない
+    candByIns.set(ins, { ins, pos: found + after.length, anchorFrom: found, top: false, key });
+    rangeCount.set(key, (rangeCount.get(key) || 0) + 1);
+  }
+  const tail = [];
+  for (const ins of failed) {
+    const c = candByIns.get(ins);
+    if (c && rangeCount.get(c.key) === 1) resolved.push(c); // 候補同士で同一範囲が重なるものは引っ張らない
+    else tail.push(ins);
   }
   resolved.sort((a, b) => a.pos - b.pos || a.ins.order - b.ins.order);
   return { resolved, tail };
@@ -333,7 +370,9 @@ async function verifyView() {
   return h;
 }
 async function topic(id) {
-  const i = D.byId[id]; setTitle(`${i.no} ${i.title}`, '#/ron');
+  const i = D.byId[id];
+  if (!i) { setTitle('論点', '#/ron'); return `<div class="card"><h2>論点が見つかりませんでした</h2><p class="muted">指定された論点は教材データにありません。リンクの入力ミスなどの可能性があります。</p><a class="btn" href="#/ron">論点の一覧へ</a></div>`; }
+  setTitle(`${i.no} ${i.title}`, '#/ron');
   const p = prog(id); const pages = await chapterPages(i.ch);
   const a = pages.findIndex(x => x.printed === i.inputPage); const nxt = D.items.filter(x => x.ch === i.ch).map(x => pages.findIndex(y => y.printed === x.inputPage)).filter(n => n > a).sort((x, y) => x - y)[0];
   const range = new Set(pages.slice(a, nxt ?? pages.length).map(x => x.printed));
@@ -372,7 +411,9 @@ async function output(args) {
   return h;
 }
 async function exam(id) {
-  const e = D.exams.find(x => x.id === id); setTitle(`${id} ${e.title || ''}`, '#/output');
+  const e = D.exams.find(x => x.id === id);
+  if (!e) { setTitle('Output', '#/output'); return `<div class="card"><h2>過去問が見つかりませんでした</h2><p class="muted">指定された過去問は教材データにありません。リンクの入力ミスなどの可能性があります。</p><a class="btn" href="#/output">過去問の一覧へ</a></div>`; }
+  setTitle(`${id} ${e.title || ''}`, '#/output');
   const at = AT[id] || [];
   return `<div class="card"><div class="muted">${esc(e.source || '(出典の自動抽出なし)')}</div>
    ${e.subQuestions.map(s => `<div style="margin-top:6px"><span class="chip">${esc((s.sub || '全体') + (s.part ? '-' + s.part : ''))}</span><span class="chip">${esc(s.formatLabel)}</span><span class="chip">重要度 ${esc(s.star || '?')}</span></div>`).join('')}
@@ -722,7 +763,8 @@ async function render() {
   try { decoded = decodeURIComponent(rawHash); } catch { /* 復号できない場合は元のまま */ }
   const [t, ...args] = (decoded || 'home').split('/');
   const fn = { home, input, ron, output, menu, review: reviewChecks }[t] || home;
-  let html; try { html = await fn(args.length ? args : []); } catch (e) { html = `<div class="warn">エラー: ${esc(e.message)}</div>`; console.error(e); }
+  // 技術的なエラーメッセージ(TypeError の英文など)は画面に出さない。詳細は console にだけ残す。
+  let html; try { html = await fn(args.length ? args : []); } catch (e) { console.error(e); html = `<div class="card"><h2>画面を表示できませんでした</h2><p class="muted">一時的な問題の可能性があります。別のタブから開き直すか、ホームに戻ってください。</p><a class="btn" href="#/home">ホームへ</a></div>`; }
   const y = scrollY; $('#view').innerHTML = html; if (t === 'home' || args.length === 0) scrollTo(0, 0); else scrollTo(0, y > 0 && ['status', 'field'].length ? y : 0);
 }
 window.addEventListener('hashchange', () => { scrollTo(0, 0); render(); });
